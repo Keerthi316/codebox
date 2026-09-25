@@ -1,0 +1,4 @@
+# Files used inside Linux containers must keep LF line endings on Windows checkouts.
+* text=auto eol=lf
+*.png binary
+*.svg text eol=lf

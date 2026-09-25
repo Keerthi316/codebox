@@ -1,0 +1,183 @@
+# CodeBox — docker compose up --build
+#
+# Trust boundaries:
+#   frontend, backend      : public-facing, NO Docker access
+#   celery-worker          : trusted; the ONLY service with the Docker socket.
+#                            It never runs user code in its own process.
+#   sandbox containers     : untrusted user code; created per job by the worker
+#                            on the host daemon with no network, no mounts,
+#                            no socket, non-root, read-only rootfs, cgroup limits.
+#   sandbox-* services     : only build the language images, then exit.
+
+name: codebox
+
+x-sandbox-image: &sandbox-image
+  # Build-only services: they exit immediately. Kept locked down anyway.
+  entrypoint: ["python3", "-c", "pass"]
+  network_mode: none
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: "no"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-codebox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-codebox}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [data]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [data]
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: base
+    image: codebox-backend:latest
+    env_file: .env
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env (see README)}
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/languages', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [data, web]
+    restart: unless-stopped
+
+  celery-worker:
+    image: codebox-backend:latest
+    command: ["sh", "-c", "exec celery -A app.workers.celery_app:celery_app worker --loglevel=INFO --concurrency=$${WORKER_CONCURRENCY:-2}"]
+    env_file: .env
+    environment:
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env (see README)}
+    # Root inside this container is needed to use the Docker socket portably
+    # (Linux and Docker Desktop). Socket access is equivalent to host root, which
+    # is why this trusted service runs no user code and exposes no ports.
+    user: "0:0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sandbox-python:
+        condition: service_completed_successfully
+      sandbox-javascript:
+        condition: service_completed_successfully
+      sandbox-java:
+        condition: service_completed_successfully
+      sandbox-cpp:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]  # socket access works through file ownership, no capabilities needed
+    security_opt: ["no-new-privileges:true"]
+    networks: [data]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    image: codebox-frontend:latest
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [web]
+    restart: unless-stopped
+
+  # ---- sandbox language images (build-only) --------------------------------
+  sandbox-python:
+    <<: *sandbox-image
+    build: { context: ./executor, dockerfile: Dockerfiles/python/Dockerfile }
+    image: codebox-sandbox-python:latest
+  sandbox-javascript:
+    <<: *sandbox-image
+    build: { context: ./executor, dockerfile: Dockerfiles/javascript/Dockerfile }
+    image: codebox-sandbox-javascript:latest
+  sandbox-java:
+    <<: *sandbox-image
+    build: { context: ./executor, dockerfile: Dockerfiles/java/Dockerfile }
+    image: codebox-sandbox-java:latest
+  sandbox-cpp:
+    <<: *sandbox-image
+    build: { context: ./executor, dockerfile: Dockerfiles/cpp/Dockerfile }
+    image: codebox-sandbox-cpp:latest
+
+  # ---- test suite: docker compose --profile test run --rm tests -------------
+  tests:
+    profiles: [test]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: test
+    image: codebox-tests:latest
+    user: "0:0"
+    environment:
+      TEST_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-codebox}:${POSTGRES_PASSWORD}@postgres:5432/codebox_test
+      REDIS_URL: redis://redis-unreachable:6379/0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sandbox-python:
+        condition: service_completed_successfully
+      sandbox-javascript:
+        condition: service_completed_successfully
+      sandbox-java:
+        condition: service_completed_successfully
+      sandbox-cpp:
+        condition: service_completed_successfully
+    networks: [data]
+
+networks:
+  # PostgreSQL and Redis live on an internal network: no host ports, no internet.
+  data:
+    internal: true
+  web: {}
+
+volumes:
+  pgdata:
+  redisdata:
